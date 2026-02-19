@@ -1,0 +1,435 @@
+# Smart POS Router — Mimari Pattern'ları Rehberi
+
+## Projenin Ödeme Akışı (Büyük Resim)
+
+Önce tüm pattern'ların **nerede devreye girdiğini** görelim:
+
+```mermaid
+sequenceDiagram
+    participant Müşteri
+    participant Gateway as API Gateway
+    participant Payment as Payment Core
+    participant Routing as Routing Service
+    participant Bank as Bank Adapter
+    participant DB as PostgreSQL
+    participant Kafka
+
+    Müşteri->>Gateway: POST /payments (JWT token)
+    Note over Gateway: ① Circuit Breaker<br/>(Gateway seviyesi)
+    Gateway->>Payment: İsteği yönlendir
+
+    Note over Payment: ② Idempotency kontrolü<br/>(Aynı istek daha önce geldi mi?)
+    Payment->>DB: Idempotency key kontrolü
+
+    Note over Payment: ③ Saga başlat<br/>(4 adımlı orkestrasyon)
+
+    rect rgb(240, 248, 255)
+        Note over Payment: SAGA ADIM 1: ROUTE
+        Payment->>Routing: Hangi bankaya gitmeli?
+        Routing-->>Payment: BANK_A seçildi
+    end
+
+    rect rgb(240, 255, 240)
+        Note over Payment: SAGA ADIM 2: AUTHORIZE
+        Payment->>Bank: authorize() çağır
+        Note over Bank: ① Circuit Breaker<br/>(Adapter seviyesi)
+        Bank-->>Payment: Auth kodu döndü
+    end
+
+    rect rgb(255, 248, 240)
+        Note over Payment: SAGA ADIM 3: CAPTURE
+        Payment->>Bank: capture() çağır
+        Bank-->>Payment: Tahsilat tamam
+    end
+
+    rect rgb(248, 240, 255)
+        Note over Payment: SAGA ADIM 4: RECORD
+        Payment->>DB: Transaction + Outbox kaydı (atomik)
+        Note over DB: ④ Outbox Pattern<br/>(DB + Kafka dual-write çözümü)
+    end
+
+    Note over DB,Kafka: ⑤ Outbox Poller (5sn'de bir)
+    DB-->>Kafka: payment.completed event'i
+```
+
+---
+
+## ① Circuit Breaker — "Sigorta Teli"
+
+### Gerçek Hayat Analojisi
+Evindeki **sigorta** gibi düşün. Elektrik yükü çok artınca sigorta **atar** ve tüm evi korur. Sigorta atmasaydı, kablolar yanardı.
+
+### Ne Problem Çözüyor?
+Banka A'nın API'si çöktü diyelim. Sen her ödeme isteğinde Banka A'ya istek atıyorsun, hepsi 10 saniye timeout oluyor. Senin **kendi sistemin de yavaşlıyor** çünkü thread'ler banka cevabını bekliyor. Buna **cascade failure** (zincirleme çökme) denir.
+
+### Nasıl Çalışıyor?
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                  Circuit Breaker Durumları               │
+│                                                         │
+│   CLOSED (Normal)     OPEN (Atık)      HALF-OPEN        │
+│   ┌──────────┐      ┌──────────┐      ┌──────────┐     │
+│   │ İstekler │      │ İstekleri│      │ 1-2 test │     │
+│   │ bankaya  │─────▶│ doğrudan │─────▶│ isteği   │     │
+│   │ gidiyor  │      │ REDDET   │      │ gönder   │     │
+│   └──────────┘      └──────────┘      └──────────┘     │
+│        │                  ▲                │            │
+│   10 istekten 5'i         │           Başarılı ise      │
+│   başarısız olursa      30sn bekle    → CLOSED'a dön    │
+│   (%50 hata oranı)                   Başarısız ise      │
+│                                      → OPEN'a dön       │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Hangi Aşamada Devreye Giriyor?
+**İki seviyede** Circuit Breaker var:
+
+| Seviye | Nerede | Ne Zaman |
+|--------|--------|----------|
+| **Gateway CB** | `api-gateway` → `payment-core-service` | Payment servisi tamamen çöktüyse, gateway direkt 503 döner |
+| **Adapter CB** | `bank-adapters` → Banka API'si | Belirli bir banka çöktüyse, o bankaya istek gitmez |
+
+### Kodda Nasıl Tanırsın?
+```java
+// Bu annotation'ı gördüğünde → Circuit Breaker var
+@CircuitBreaker(name = "bankA", fallbackMethod = "fallback")
+@Retry(name = "bankA")          // 3 kez dene, sonra pes et
+@Bulkhead(name = "bankA")       // Max 10 eşzamanlı istek
+public PaymentResponse authorize(PaymentRequest req) { ... }
+```
+
+- `@CircuitBreaker` → sigorta
+- `@Retry` → tekrar deneme (sadece geçici hatalarda, 4xx'te denemez)
+- `@Bulkhead` → eşzamanlı istek limiti (thread pool koruması)
+
+> [!TIP]
+> **4xx hatalar** (müşteri hatası) retry edilmez çünkü tekrar denesen de aynı sonuç gelir.
+> **5xx hatalar** (sunucu hatası) retry edilir çünkü geçici olabilir.
+
+---
+
+## ② Idempotency — "Aynı İşlemi İki Kez Yapmama Garantisi"
+
+### Gerçek Hayat Analojisi
+ATM'den para çekerken internet koptu. İşlem gerçekleşti mi bilemiyorsun. Tekrar çekme butonuna basıyorsun. Idempotency **yoksa** → 2 kez para çekilir. Idempotency **varsa** → sistem "bu işlemi zaten yaptım" der, aynı sonucu döner.
+
+### Ne Problem Çözüyor?
+Dağıtık sistemlerde ağ hataları, timeout, retry mekanizmaları yüzünden **aynı istek birden fazla kez gelebilir**. Ödeme sisteminde bu, müşteriden **çift para çekilmesi** demek.
+
+### Nasıl Çalışıyor?
+
+```
+Müşteri: POST /payments
+         Header: X-Idempotency-Key: "abc-123"
+
+           ┌──────────────────────────────────┐
+           │     Idempotency Key "abc-123"    │
+           │     DB'de var mı?                │
+           └──────────┬───────────────────────┘
+                      │
+              ┌───────┴───────┐
+              │               │
+         YOK (ilk kez)   VAR (tekrar)
+              │               │
+              ▼               ▼
+     ┌────────────┐   ┌──────────────────┐
+     │ İşlemi yap │   │ Durumuna bak:    │
+     │ DB'ye kaydet│   │ SUCCESS → cevabı │
+     │ key = abc123│   │   cache'ten dön  │
+     └────────────┘   │ PROCESSING → 409 │
+                      │   (conflict)     │
+                      └──────────────────┘
+```
+
+### Kodda Nasıl Tanırsın?
+```java
+// Bu yapıları gördüğünde → Idempotency var
+@Column(unique = true)
+private String idempotencyKey;    // DB'de unique constraint
+
+// SELECT FOR UPDATE → satır seviyesi kilit
+@Query("SELECT t FROM Transaction t WHERE t.idempotencyKey = :key FOR UPDATE")
+Optional<Transaction> findByKeyForUpdate(@Param("key") String key);
+```
+
+`SELECT FOR UPDATE` → aynı anda iki thread aynı key ile gelirse, biri **kilitlenir** ve bekler. İlki bitince ikincisi "zaten var" der.
+
+---
+
+## ③ Saga Pattern — "Adım Adım İşlem + Geri Alma Planı"
+
+### Gerçek Hayat Analojisi
+Tatil planlıyorsun: (1) Uçak bileti al → (2) Otel rezervasyonu yap → (3) Araç kirala. 3. adımda araç kalmadığını öğrendin. Ne yaparsın? **Geriye doğru iptal**: Oteli iptal et → uçak biletini iptal et. İşte Saga budur.
+
+### Ne Problem Çözüyor?
+Monolith'te tek bir `@Transactional` ile her şeyi yapardın:
+```java
+@Transactional
+void pay() {
+    route();      // Banka seç
+    authorize();  // Bankadan onay al
+    capture();    // Parayı çek
+    record();     // Kaydet
+}
+// Herhangi biri fail olursa → hepsi rollback
+```
+
+Ama **mikroservislerde bu MÜMKÜN DEĞİL** çünkü her servis kendi DB'sine sahip. Tek bir DB transaction'ı ile birden fazla servisi kapsayamazsın. Saga, bunu **compensating transaction** (telafi işlemi) ile çözüyor.
+
+### Nasıl Çalışıyor?
+
+```
+MUTLU YOL (her şey başarılı):
+═══════════════════════════════
+  ROUTE ──✓──▶ AUTHORIZE ──✓──▶ CAPTURE ──✓──▶ RECORD ──✓──▶ ✅ SUCCESS
+
+BAŞARISIZ YOL (Capture başarısız):
+═══════════════════════════════════
+  ROUTE ──✓──▶ AUTHORIZE ──✓──▶ CAPTURE ──✗
+                                    │
+                    ◀── GERİ AL ────┘
+                    │
+          AUTHORIZE'ı geri al (reverse)
+                    │
+                    ▼
+                 ❌ FAILED
+```
+
+### Saga State Machine
+
+```
+┌────────────┐    ┌────────────┐    ┌────────────┐    ┌────────────┐
+│   ROUTE    │───▶│ AUTHORIZE  │───▶│  CAPTURE   │───▶│   RECORD   │
+│            │    │            │    │            │    │            │
+│ compensate:│    │ compensate:│    │ compensate:│    │ compensate:│
+│  (yok)     │    │  reverse() │    │  reverse() │    │  (yok)     │
+└────────────┘    └────────────┘    └────────────┘    └────────────┘
+```
+
+Her adımın bir `execute()` ve bir `compensate()` metodu var. Hata olunca, **o ana kadar başarılı olan adımlar ters sırayla compensate edilir**.
+
+### Kodda Nasıl Tanırsın?
+```java
+// Bu interface'i gördüğünde → Saga Pattern var
+public interface SagaStep {
+    void execute(SagaContext context);      // İleri git
+    void compensate(SagaContext context);   // Geri al
+}
+
+// Bu entity'yi gördüğünde → Saga state tracking
+@Entity
+@Table(name = "saga_state")
+public class SagaState {
+    private String sagaId;
+    private String currentStep;   // ROUTE / AUTHORIZE / CAPTURE / RECORD
+    private String status;        // RUNNING / COMPLETED / COMPENSATING / FAILED
+    private String payload;       // JSONB — context bilgisi
+}
+```
+
+> [!IMPORTANT]
+> **Saga vs 2PC (Two-Phase Commit)**:
+> - 2PC → tüm katılımcıları **kilitler**, biri başarısız olursa hepsi geri alınır (monolith gibi). Yavaş, ölçeklenmez.
+> - Saga → her adım **bağımsız commit** eder, hata olursa compensating transaction çalışır. Eventually consistent ama hızlı.
+
+---
+
+## ④ Outbox Pattern — "DB ve Kafka'ya Aynı Anda Güvenli Yazma"
+
+### Gerçek Hayat Analojisi
+Bir sipariş verdin. Mağaza hem (1) siparişi defterine yazmak hem de (2) kargoya vermek istiyor. İkisini **aynı anda** yapamaz. Ya defterine yazar ama kargoya vermeden mağaza yanarsa? Ya da kargoya verir ama defterine yazmazsa?
+
+Çözüm: Mağaza **sadece defterine yazar** (bir "gönderilecek" bölümüne). Sonra bir kurye **düzenli olarak** defteri kontrol eder ve "gönderilecek" olanları kargoya verir.
+
+### Ne Problem Çözüyor? (Dual-Write Problemi)
+
+```
+❌ TEHLİKELİ KOD (Dual-Write):
+══════════════════════════════
+@Transactional
+void processPayment() {
+    db.save(transaction);         // 1. DB'ye yaz     ✓ başarılı
+    kafka.send("payment.done");   // 2. Kafka'ya yaz  ✗ HATA!
+}
+// Sonuç: DB'de kayıt var ama Kafka'da event yok
+// Diğer servisler bu ödemeyi hiç bilmiyor!
+```
+
+DB ve Kafka **iki farklı sistem**. Bunların atomik (hep beraber başarılı veya hep beraber başarısız) olmasını garantileyemezsin.
+
+### Nasıl Çalışıyor?
+
+```
+✅ OUTBOX PATTERN:
+══════════════════
+
+ADIM 1 — Atomik DB yazma (@Transactional):
+┌──────────────────────────────────────────┐
+│  BEGIN TRANSACTION                       │
+│    INSERT INTO transactions (...)        │
+│    INSERT INTO outbox_events (           │
+│        event_type = 'payment.completed', │
+│        payload = '{...}',               │
+│        processed_at = NULL              │
+│    )                                     │
+│  COMMIT                                  │
+└──────────────────────────────────────────┘
+Her ikisi de aynı DB transaction'ında → ya ikisi de yazılır, ya ikisi de yazılmaz.
+
+ADIM 2 — Outbox Poller (5 saniyede bir):
+┌──────────────────────────────────────────┐
+│  SELECT * FROM outbox_events             │
+│  WHERE processed_at IS NULL              │
+│  ORDER BY created_at                     │
+│  LIMIT 100                               │
+│                                          │
+│  → Kafka'ya gönder                       │
+│  → processed_at = NOW() olarak güncelle  │
+│  → 5 başarısız deneme → DEAD olarak işaretle │
+└──────────────────────────────────────────┘
+```
+
+### Kodda Nasıl Tanırsın?
+```java
+// Bu tabloyu gördüğünde → Outbox Pattern var
+@Entity
+@Table(name = "outbox_events")
+public class OutboxEvent {
+    private String eventType;      // "payment.completed"
+    private String payload;        // JSON veri
+    private Instant processedAt;   // NULL = henüz Kafka'ya gönderilmedi
+    private int retryCount;        // Başarısız deneme sayısı
+}
+
+// Bu scheduled job'u gördüğünde → Outbox Poller
+@Scheduled(fixedDelay = 5000)  // 5 saniyede bir
+void pollOutbox() {
+    List<OutboxEvent> pending = repo.findByProcessedAtIsNull();
+    for (OutboxEvent event : pending) {
+        kafka.send(event.getTopic(), event.getPayload());
+        event.setProcessedAt(Instant.now());
+    }
+}
+```
+
+---
+
+## Pattern Tespiti — Hızlı Referans
+
+Bir projeye baktığında şu ipuçlarını ara:
+
+| Pattern | Anahtar İpuçları |
+|---------|-----------------|
+| **Circuit Breaker** | `@CircuitBreaker`, `@Retry`, `@Bulkhead`, Resilience4j dependency, `fallbackMethod` |
+| **Idempotency** | `idempotencyKey` alanı, `unique constraint`, `SELECT FOR UPDATE`, `X-Idempotency-Key` header |
+| **Saga** | `SagaStep` interface, `execute()`/`compensate()` metotları, `saga_state` tablosu, `currentStep`/`status` alanları |
+| **Outbox** | `outbox_events` tablosu, `processed_at IS NULL` sorgusu, `@Scheduled` poller, Kafka producer |
+
+---
+
+## Multi-Module'den Mikroservise Geçiş
+
+### Şu Anki Yapı (Multi-Module Monorepo)
+
+```
+smart-pos-router/          ← Tek Git repo
+├── pom.xml                ← Parent POM (her şeyi yönetir)
+├── common-lib/            ← Paylaşılan kütüphane (JAR)
+├── api-gateway/           ← Spring Boot App
+├── routing-service/       ← Spring Boot App
+├── payment-core-service/  ← Spring Boot App
+├── bank-adapters/         ← Spring Boot App
+└── reconciliation-service/← Spring Boot App
+```
+
+**Şu an**: `mvn package` ile tek seferde hepsi derleniyor. Her modül kendi JAR/fat-JAR'ını üretiyor ama aynı repo'dayız.
+
+### Mikroservise Geçiş (3 Aşama)
+
+#### Aşama 1: Docker ile İzolasyon (Kolay)
+Her modüle bir `Dockerfile` ekle. `docker-compose` ile hepsini ayrı container'da çalıştır.
+
+```yaml
+# docker-compose.yml
+services:
+  api-gateway:
+    build: ./api-gateway
+    ports: ["8080:8080"]
+
+  payment-core:
+    build: ./payment-core-service
+    depends_on: [postgres, kafka]
+
+  routing:
+    build: ./routing-service
+    depends_on: [postgres, redis]
+
+  bank-adapters:
+    build: ./bank-adapters
+```
+
+**Bu aşamada hâlâ tek repo'dasın** ama her servis kendi container'ında çalışıyor. Servislerin arasındaki iletişim HTTP + Kafka üzerinden.
+
+#### Aşama 2: Repo Ayrımı (Orta)
+
+```
+# Tek repo'dan bağımsız repo'lara
+smart-pos-router/
+├── common-lib/         →  github.com/smartpos/common-lib
+├── api-gateway/        →  github.com/smartpos/api-gateway
+├── routing-service/    →  github.com/smartpos/routing-service
+├── payment-core/       →  github.com/smartpos/payment-core
+├── bank-adapters/      →  github.com/smartpos/bank-adapters
+└── reconciliation/     →  github.com/smartpos/reconciliation
+```
+
+`common-lib` artık **Maven artifact** olarak Nexus/GitHub Packages'a publish edilir. Diğer servisler onu dependency olarak çeker:
+```xml
+<dependency>
+    <groupId>com.smartpos</groupId>
+    <artifactId>common-lib</artifactId>
+    <version>1.2.0</version>  <!-- Artık sabit versiyon -->
+</dependency>
+```
+
+#### Aşama 3: Kubernetes/ECS Deployment (İleri)
+
+```
+┌─────────────────────────────────────────────────┐
+│                 Kubernetes Cluster               │
+│                                                 │
+│  ┌─────────┐  ┌─────────┐  ┌──────────────┐   │
+│  │ Gateway │  │ Payment │  │  Routing     │   │
+│  │ Pod x2  │  │ Pod x3  │  │  Pod x2      │   │
+│  └────┬────┘  └────┬────┘  └──────────────┘   │
+│       │            │                            │
+│  ┌────┴────────────┴────────────────────────┐  │
+│  │        Kubernetes Service Discovery       │  │
+│  │   (gateway.default.svc.cluster.local)     │  │
+│  └───────────────────────────────────────────┘  │
+│                                                 │
+│  ┌──────────┐  ┌───────┐  ┌────────┐          │
+│  │PostgreSQL│  │ Redis │  │ Kafka  │          │
+│  │ (RDS)    │  │(Elast)│  │ (MSK)  │          │
+│  └──────────┘  └───────┘  └────────┘          │
+└─────────────────────────────────────────────────┘
+```
+
+Her servis **bağımsız ölçeklenir**: ödeme yoğunsa Payment pod sayısını artır, routing yoğunsa Routing pod sayısını artır.
+
+### Neden Şu An Multi-Module Monorepo Doğru Seçim?
+
+> [!NOTE]
+> Erken mikroservis ayrımı **en yaygın mimari hatadır**. Martin Fowler'ın tavsiyesi:
+> *"Monolith first, then extract microservices."*
+
+| Kriter | Multi-Module Mono | Tam Mikroservis |
+|--------|-------------------|-----------------|
+| **Geliştirme hızı** | ✅ Tek IDE, tek build | ❌ N repo, N CI pipeline |
+| **Refactoring** | ✅ Tek commit'te her yeri değiştir | ❌ N repo'da koordineli PR |
+| **Debugging** | ✅ Tek JVM, tek log | ❌ Distributed tracing zorunlu |
+| **Deploy** | ❌ Hep beraber deploy | ✅ Bağımsız deploy |
+| **Ölçekleme** | ❌ Hep beraber ölçekle | ✅ Servis bazlı ölçekleme |
+
+Şu an geliştirme aşamasında olduğun için **monorepo avantajlarından** faydalanıyorsun. Ürün olgunlaşınca **Docker → Repo Ayrımı → K8s** aşamalarıyla kademeli geçiş yapılabilir.
